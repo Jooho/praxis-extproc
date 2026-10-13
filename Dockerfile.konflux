@@ -16,7 +16,7 @@ ARG UBI9_DIGEST=sha256:beba9460df08acc9f2d5a99f61b8544d5367b05e02c945ca726c6f07c
 ARG UBI9_MINIMAL_PQC_DIGEST=sha256:db10c80537d786068c7c911d7ef6ea103315d0615fa4b39b5946f7976563a8d7
 
 # Mirrors FIPS_FEATURES in the Makefile and Containerfile.
-ARG CARGO_FEATURES="responses,aws-sigv4"
+ARG CARGO_FEATURES="responses,aws-sigv4,store-postgres-cert-auth"
 ARG CARGO_PROFILE=release
 ARG CARGO_ARGS="--ignore-rust-version"
 
