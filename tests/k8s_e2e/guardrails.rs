@@ -59,8 +59,8 @@ async fn malicious_prompt_blocked_at_request() {
 }
 
 /// A request-phase callout failure must fail closed: the mock returns 5xx on the
-/// input rail and, with `failure_mode_allow: false`, the filter rejects so the
-/// client gets a server error instead of a pass-through.
+/// input rail and the request is rejected, so the client gets a server error
+/// instead of a pass-through.
 #[tokio::test]
 async fn provider_failure_fails_closed_at_request() {
     ensure_gateway_ready().await;
