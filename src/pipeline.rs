@@ -93,7 +93,7 @@ async fn run_request_pipeline_inner(
         return Ok(vec![response::immediate(immediate)]);
     }
 
-    if selected_input_exceeds_limit(phase, pipeline, &ctx, state.request_body.len()) {
+    if selected_input_exceeds_limit(phase, pipeline, state.request_body.len()) {
         return Ok(vec![selected_input_limit_rejection()]);
     }
 
@@ -122,15 +122,9 @@ async fn run_request_pipeline_inner(
 }
 
 /// Check the selected input before a body filter can shrink or rewrite it.
-fn selected_input_exceeds_limit(
-    phase: RequestPhase,
-    pipeline: &FilterPipeline,
-    ctx: &HttpFilterContext<'_>,
-    body_len: usize,
-) -> bool {
+fn selected_input_exceeds_limit(phase: RequestPhase, pipeline: &FilterPipeline, body_len: usize) -> bool {
     matches!(phase, RequestPhase::Body)
         && pipeline.body_capabilities().needs_selected_upstream_request_body
-        && (ctx.cluster.is_some() || ctx.upstream.is_some())
         && body_len > pipeline.selected_upstream_request_body_limit()
 }
 
@@ -397,6 +391,29 @@ pub(crate) fn passthrough_chunk(
     responses
 }
 
+/// Hold response bytes until filters that requested a complete body can inspect them.
+fn buffer_response_chunk(
+    ctx: &HttpFilterContext<'_>,
+    chunk: &mut Vec<u8>,
+    buffered: &mut Vec<u8>,
+    eos: bool,
+    server_limit: Option<usize>,
+) -> Result<(), Status> {
+    let praxis_filter::BodyMode::StreamBuffer { max_bytes } = ctx.response_body_mode else {
+        return Ok(());
+    };
+    let total = buffered.len().saturating_add(chunk.len());
+    if max_bytes.into_iter().chain(server_limit).any(|limit| total > limit) {
+        metrics::record_body_size_rejection();
+        return Err(Status::resource_exhausted("buffered response exceeds maximum size"));
+    }
+    buffered.append(chunk);
+    if eos {
+        *chunk = mem::take(buffered);
+    }
+    Ok(())
+}
+
 /// Build a `HeadersResponse` carrying the deferred header-phase mutation.
 ///
 /// Consumes the parked `deferred_*_header_mutation` for the direction. Used to
@@ -453,6 +470,15 @@ pub(crate) async fn process_streamed_body_chunk(
     let eos = body.end_of_stream;
     let mut chunk = body.body;
     let original_chunk_had_bytes = !chunk.is_empty();
+    if !is_request {
+        buffer_response_chunk(
+            &ctx,
+            &mut chunk,
+            &mut state.response_body,
+            eos,
+            state.max_body_accumulation,
+        )?;
+    }
     let reject = if is_request {
         run_body_filters(pipeline, &mut ctx, &mut chunk, eos).await?
     } else {
@@ -639,6 +665,13 @@ pub(crate) async fn run_response_header_filters_early(
         return Ok(vec![response::immediate(imm)]);
     }
 
+    if state.protocol_config.response_body_mode == BodyMode::None
+        && matches!(ctx.response_body_mode, praxis_filter::BodyMode::StreamBuffer { .. })
+    {
+        let rejection = praxis_filter::Rejection::status(502)
+            .with_body(b"response filters require response body delivery; NONE mode is unsupported".to_vec());
+        return Ok(vec![response::immediate(adapter::rejection_to_immediate(&rejection))]);
+    }
     state.header_state.response_filters_executed = true;
     let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
     ctx.dehydrate(&mut state.carried_context)?;
@@ -741,7 +774,7 @@ async fn run_body_filters(
     Ok(immediate_from_action(action))
 }
 
-/// Run selected-upstream body filters after request headers have selected a logical provider.
+/// Run selected-upstream body filters after request headers, including Envoy-routed requests.
 ///
 /// The filter's request limit is checked against the incoming body before this hook. Rewritten
 /// output uses the server accumulation ceiling so translation overhead does not consume the
@@ -752,9 +785,7 @@ async fn run_selected_upstream_body_filters(
     body_buf: &mut Vec<u8>,
     max_body_accumulation: Option<usize>,
 ) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
-    if !pipeline.body_capabilities().needs_selected_upstream_request_body
-        || (ctx.cluster.is_none() && ctx.upstream.is_none())
-    {
+    if !pipeline.body_capabilities().needs_selected_upstream_request_body {
         return Ok(None);
     }
 
@@ -821,6 +852,13 @@ pub(crate) async fn flush_streamed_body_filters(
     state: &mut StreamState,
     is_request: bool,
 ) -> Result<Vec<ProcessingResponse>, Status> {
+    if !is_request && !state.response_body.is_empty() {
+        // A trailers reply cannot carry the buffered replacement body. Refuse
+        // the response rather than silently dropping its pending checks.
+        let rejection = praxis_filter::Rejection::status(502)
+            .with_body(b"buffered response filters require a final body message before trailers".to_vec());
+        return Ok(vec![response::immediate(adapter::rejection_to_immediate(&rejection))]);
+    }
     let request = state.request.as_ref().ok_or_else(|| {
         metrics::record_invalid_argument("missing_headers", "request");
         Status::invalid_argument("request headers not received")
@@ -1584,7 +1622,7 @@ mod tests {
 
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "tests")]
-    async fn unselected_request_skips_selected_upstream_hook() {
+    async fn envoy_routed_request_runs_selected_upstream_hook() {
         let pipeline = single_filter_pipeline("unselected_body", UnselectedBodyFilter::from_config);
         let mut state = StreamState::new();
         state.request = Some(adapter::envoy_headers_to_request(&[]));
@@ -1592,42 +1630,44 @@ mod tests {
 
         let responses = run_request_pipeline(RequestPhase::Body, &pipeline, &mut state, true)
             .await
-            .expect("request without selection should pass through");
-        assert_eq!(immediate_status(&responses), None);
+            .expect("Envoy-routed request should run the configured body hook");
+        assert_eq!(immediate_status(&responses), Some(422));
         assert_eq!(state.request_body, b"unchanged");
     }
 
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "tests")]
-    async fn unselected_streamed_request_does_not_defer_headers_or_body() {
-        use praxis_proto::envoy::service::ext_proc::v3::processing_response::Response as Payload;
+    async fn envoy_routed_body_hook_rejects_unsupported_request_modes() {
+        let pipeline = single_filter_pipeline("unselected_body", UnselectedBodyFilter::from_config);
+        for mode in [BodyMode::None, BodyMode::Streamed, BodyMode::FullDuplexStreamed] {
+            let mut state = StreamState::new();
+            state.protocol_config.request_body_mode = mode;
+            let headers = crate::handlers::handle_request_headers(
+                &pipeline,
+                praxis_proto::envoy::service::ext_proc::v3::HttpHeaders::default(),
+                &mut state,
+            )
+            .await
+            .expect("unsupported body mode should produce a local rejection");
+            assert_eq!(
+                immediate_status(&headers),
+                Some(500),
+                "mode {mode:?} must reject before forwarding"
+            );
+        }
+    }
 
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    async fn envoy_routed_body_hook_enforces_input_limit() {
         let pipeline = single_filter_pipeline("unselected_body", UnselectedBodyFilter::from_config);
         let mut state = StreamState::new();
-        state.protocol_config.request_body_mode = BodyMode::Streamed;
-        let headers = crate::handlers::handle_request_headers(
-            &pipeline,
-            praxis_proto::envoy::service::ext_proc::v3::HttpHeaders::default(),
-            &mut state,
-        )
-        .await
-        .expect("unselected headers should be acknowledged");
-        assert!(matches!(
-            headers.first().and_then(|item| item.response.as_ref()),
-            Some(Payload::RequestHeaders(_))
-        ));
-
-        let body = crate::handlers::handle_request_body(
-            &pipeline,
-            praxis_proto::envoy::service::ext_proc::v3::HttpBody {
-                body: b"plain".to_vec(),
-                end_of_stream: true,
-            },
-            &mut state,
-        )
-        .await
-        .expect("unselected body should pass through");
-        assert_eq!(body.first().and_then(emitted_request_body), Some(&b"plain"[..]));
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        state.request_body = vec![b' '; pipeline.selected_upstream_request_body_limit() + 1];
+        let responses = run_request_pipeline(RequestPhase::Body, &pipeline, &mut state, true)
+            .await
+            .expect("oversized Envoy-routed request should produce a local rejection");
+        assert_eq!(immediate_status(&responses), Some(413));
     }
 
     #[tokio::test]
@@ -2524,6 +2564,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streamed_response_body_bytes_accumulate_across_chunks() {
+        use praxis_proto::envoy::service::ext_proc::v3::HttpBody;
+
+        let pipeline = carry_probe_pipeline();
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        state.response = Some(adapter::envoy_headers_to_response(&[]));
+
+        let mut total = 0_u64;
+        for (size, end_of_stream) in [(1000, false), (7, true)] {
+            process_streamed_body_chunk(
+                &pipeline,
+                HttpBody {
+                    body: vec![b'x'; size],
+                    end_of_stream,
+                },
+                &mut state,
+                false,
+            )
+            .await
+            .unwrap();
+            total += size as u64;
+            assert_eq!(
+                state.carried_context.as_ref().unwrap().response_body_bytes,
+                total,
+                "streamed response byte counts must accumulate across chunks"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn carried_state_survives_early_header_phases() {
         let pipeline = carry_probe_pipeline();
         let mut state = StreamState::new();
@@ -2638,6 +2709,9 @@ mod tests {
             .filter_metadata
             .insert("carry.meta".to_owned(), "kept".to_owned());
         hydrated.filter_state.insert(7, Box::new(Probe(PROBE_VALUE)));
+        hydrated.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: Some(1234) };
+        hydrated.request_body_bytes = 101;
+        hydrated.response_body_bytes = 202;
 
         // Capture (`dehydrate`) must move every field into the empty slot.
         let mut slot = None;
@@ -2652,21 +2726,39 @@ mod tests {
             executed_filter_indices,
             filter_metadata,
             filter_state,
+            response_body_mode,
+            request_body_bytes,
+            response_body_bytes,
         } = &carried;
+        assert!(
+            matches!(
+                response_body_mode,
+                Some(praxis_filter::BodyMode::StreamBuffer { max_bytes: Some(1234) })
+            ),
+            "response body mode must survive dehydrate"
+        );
         assert_eq!(cluster.as_deref(), Some("selected-cluster"));
         assert_eq!(branch_iterations.get("branch-a"), Some(&3));
         assert_eq!(executed_filter_indices, &vec![true, false, true]);
         assert_eq!(filter_metadata.get("carry.meta").map(String::as_str), Some("kept"));
         assert!(filter_state.contains_key(&7));
+        assert_eq!(*request_body_bytes, 101);
+        assert_eq!(*response_body_bytes, 202);
 
         // hydrate must restore every field into a freshly built context,
         // consuming the parked value and emptying the slot.
         let fresh = adapter::build_filter_context(&pipeline, &request, false);
         let hydrated = HydratedContext::hydrate(Some(carried), fresh).unwrap();
         assert_eq!(hydrated.cluster.as_deref(), Some("selected-cluster"));
+        assert!(matches!(
+            hydrated.response_body_mode,
+            praxis_filter::BodyMode::StreamBuffer { max_bytes: Some(1234) }
+        ));
         assert_eq!(hydrated.branch_iterations.get("branch-a"), Some(&3));
         assert_eq!(hydrated.executed_filter_indices, vec![true, false, true]);
         assert_eq!(hydrated.get_metadata("carry.meta"), Some("kept"));
+        assert_eq!(hydrated.request_body_bytes, 101);
+        assert_eq!(hydrated.response_body_bytes, 202);
         let restored = hydrated
             .filter_state
             .get(&7)
