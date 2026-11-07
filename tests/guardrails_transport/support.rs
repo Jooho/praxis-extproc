@@ -11,6 +11,7 @@ use http_body_util::{BodyExt as _, Full};
 use hyper::{Request, Response, body::Incoming, service::service_fn};
 use praxis_extproc::{
     config::{ExtProcConfig, build_pipeline},
+    response_mode::ResponseModeSelector,
     server::PraxisExtProc,
 };
 use praxis_proto::envoy::service::{
@@ -84,11 +85,14 @@ impl Harness {
             }
         });
         let cfg = configuration(&endpoint, translation, limit);
+        let response_mode_selector = ResponseModeSelector::from_config(&cfg.filter_chains);
         let pipeline = build_pipeline(&cfg, &praxis_ai_filters::build_ai_registry()).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let service = ExternalProcessorServer::new(
-            PraxisExtProc::new(pipeline).with_max_body_accumulation(cfg.max_body_accumulation()),
+            PraxisExtProc::new(pipeline)
+                .with_max_body_accumulation(cfg.max_body_accumulation())
+                .with_response_mode_selector(response_mode_selector),
         );
         let server = tokio::spawn(async move {
             Server::builder()
